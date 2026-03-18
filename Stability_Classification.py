@@ -147,7 +147,7 @@ def bootstrap_cindex(time, event, risk, n_boot=1000, random_state=0):
 
 
 # def cross_validation_RFE():
-def stability_selection_cox(X_surv, y_surv, X_logistic, y_logistic,
+def stability_selection_logreg(X_surv, y_surv, X_logistic, y_logistic,
     output_file, num_features):
 
     out_file_models = f"{output_file}_models.csv"
@@ -185,10 +185,9 @@ def stability_selection_cox(X_surv, y_surv, X_logistic, y_logistic,
             # print(f'Running stability selection with random state: {random_state}')
             ## Randomly select half of the data
             cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=random_state)
-            for index, _ in cv.split(X_logit_scaled, y_surv['event']):
+            for index, _ in cv.split(X_logit_scaled, y_logistic):
                 X_sub = X_logit_scaled.iloc[index]
                 Y_sub = y_logistic[index]
-                df = X_sub.copy()
                 
                 #Initialize Logistic Regression
                 log_reg = LogisticRegression(penalty=None,
@@ -236,11 +235,6 @@ def stability_selection_cox(X_surv, y_surv, X_logistic, y_logistic,
         X_select = X_logit_scaled[selected_features]
 
 
-        #Initialize Logistic Regression
-        log_reg = LogisticRegression(penalty=None,
-                                     solver='lbfgs',
-                                     max_iter=1000)
-
         #Fit the log reg model
         # align y to X_select index in case indices differ
         y_aligned = y_logistic.loc[X_select.index] if hasattr(y_logistic, "loc") else pd.Series(y_logistic, index=X_select.index)
@@ -253,7 +247,7 @@ def stability_selection_cox(X_surv, y_surv, X_logistic, y_logistic,
 
         # USE RISK SCORES TO FIT MODEL..
         risk_linear = X_select.values @ effect.values   # shape (20,)
-        risk_log_reg = LogisticRegression(penalty='none', solver='lbfgs', max_iter=1000)
+        risk_log_reg = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000)
         risk_log_reg.fit(risk_linear.reshape(-1, 1), y_aligned)
 
         print("Logistic-on-risk coefficients (intercept, slope):")
@@ -269,7 +263,7 @@ def stability_selection_cox(X_surv, y_surv, X_logistic, y_logistic,
 
         ## Save Predicted response
         probs_df = pd.DataFrame({"Response": y_aligned,
-                                 "RiskLinear": risk_linear,
+                                 "RiskScore": risk_linear,
                                  "Prob": probs}, index=X_select.index)
 
         probs_df.to_csv(f"{output_file}_ResponseProbs.csv", index=False)
@@ -307,14 +301,8 @@ def stability_selection_cox(X_surv, y_surv, X_logistic, y_logistic,
 
 
 
-
-
-
-
-
-
         ## Calculate C Index for Holdout data!
-        risk_surv = X_select[selected_features].values @ effect.values
+        risk_surv = X_surv_scaled[selected_features].values @ effect.values
         print(risk_surv)
 
         df_cph = pd.DataFrame({"time": y_surv["time"],
@@ -430,29 +418,25 @@ def main():
         feats_present = [c for c in feats if c in df_surv.columns]
 
         df_surv = df_surv.loc[df_surv['Arm'] == 'Arm 1']
-        # print(df_surv['Arm'])
+        print(df_surv['Arm'])
 
         event, time, X_surv_df, y_surv = create_XY_response(df_surv, feats_present,
                                                      event_col=row["event"], 
                                                      time_col=row["time"])
-        
+        print("Created X and Y dataframes for survival")
+
         _, _, X_lr_df, y_lr = create_XY_response(df_logit, feats_present,
                                         response_col=row["logit_response"])
 
+        print("Created X and Y dataframes for classification")
        ## Remove correlated features
-        ## Make sure to keep 'transf HPV16/18 copies per ml of plasma D1'
-        #no_corr = ['transf HPV16/18 copies per ml of plasma D1', 'HPV16/18 copies per ml of plasma D1']
-        #cols_for_corr = [c for c in X_train.columns if c not in no_corr]
+        X_lr_drop = tr.fit_transform(X_lr_df[X_lr_df.columns])
+        X_surv_drop = X_surv_df[X_lr_drop.columns]
 
-        X_surv_drop = tr.fit_transform(X_surv_df[X_surv_df.columns])
-        #drop = ['LAP TGF-beta-1', 'Eosinophil Abs  D1', 'WBC D1', 'sCD27/IL8 D1']
-        #X_train_drop_corr = X_train.drop(columns=drop, errors='ignore')
-        X_lr_drop = X_lr_df[X_surv_drop.columns]
-
-        dropped_features = list(set(X_surv_df.columns) - set(X_surv_drop.columns))
+        dropped_features = list(set(X_lr_df.columns) - set(X_lr_drop.columns))
         print("Dropped features:", dropped_features)
 
-        corr = X_surv_df.corr(method="spearman")
+        corr = X_lr_df.corr(method="spearman")
 
         # Print the top absolute correlations
         tri = corr.where(~np.tril(np.ones(corr.shape), k=0).astype(bool))
@@ -473,19 +457,22 @@ def main():
 
         y_surv = np.array(list(zip(event, time)),
                    dtype=[('event', '?'), ('time', '<f8')])
+        
+        print("Y surv:")
+        print(y_surv)
 
         stamp = datetime.now().strftime("%Y-%m-%d_%H")
-        out_dir = Path(args.out_root) / "metrics" / stamp  / f"Stability_Selection_CPH_{dataset}__{featureset}"
+        out_dir = Path(args.out_root) / "metrics" / stamp  / f"Stability_Selection_LR_{str(row['logitdata'])}__{featureset}"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_file = out_dir / f"Stability_Selection_OUT"
 
 
         ## CPH-based RFE
-        folds = int(row["folds"])
+        num_feat = int(row["feature_num"])
 
-        stability_selection_cox(X_surv_drop, y_surv, 
+        stability_selection_logreg(X_surv_drop, y_surv, 
                                 X_lr_drop, y_lr,
-                                out_file, folds)
+                                out_file, num_feat)
 
  
         save_dir = Path("data-wrangle/TrainTestSets")     
